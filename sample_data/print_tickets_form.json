@@ -1,0 +1,24 @@
+{
+  "key": "PS-1101",
+  "cohort": "专色机",
+  "day": 2,
+  "received": 3,
+  "revision": 1,
+  "result_day": 5,
+  "outcome": 0.0,
+  "observed": true,
+  "form": {
+    "机台密度": {
+      "cyan_milli_od": -30,
+      "magenta_milli_od": 310
+    },
+    "套准读数": {
+      "plate_nm": 63000,
+      "paper_basis_points": 470
+    },
+    "纸张墨路": {
+      "ink_deci_c": 320,
+      "image_work_blocks": 9
+    }
+  }
+}

@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 
@@ -13,6 +13,8 @@ from .signoff_slip import service as audit_service
 from .press_shifts import contracts as window_contract
 
 PRESET = Path(__file__).resolve().parents[2] / 'sample_data' / 'print_tickets_sample.json'
+cohort_cyan_limits = dispatch_service.cohort_cyan_limits
+cyan_limits = cohort_cyan_limits
 MODULES = (('print_tickets', '色样票'),
  ('press_shifts', '印刷班次'),
  ('pigment_context', '颜料因素'),
@@ -105,6 +107,64 @@ def calibrate_cell(source, oversight):
     return parameters,verified,output
 
 
+def estimate_point(vector, kernel, calibration):
+    return calibration_service.check_point(model_service.predict_one(kernel, vector), calibration)
+
+
+def build_cyan_probes(windows, vectors, state, kernel, calibration):
+    """Recompute cyan-only gaps over mature same-cohort measured extrema."""
+    limits = dispatch_service.cohort_cyan_limits(windows.train)
+    counts = {}
+    for record in windows.train:
+        if record.cyan_shift is not None:
+            counts[record.cohort] = counts.get(record.cohort, 0) + 1
+
+    probes = {}
+    for key, vector in vectors.items():
+        if frozenset(vector.missing) != {'cyan_shift'}:
+            continue
+        count = counts.get(vector.cohort, 0)
+        if vector.cohort not in limits:
+            probes[key] = dispatch_service.CyanProbe(
+                vector.cohort, count, None, None, None, None, None, None)
+            continue
+
+        value_low, value_high = limits[vector.cohort]
+        endpoint_estimates = []
+        for cyan_value in (value_low, value_high):
+            modified = tuple(cyan_value if index == 0 else value
+                             for index, value in enumerate(vector.input_values))
+            normalized, factors, excursions = feature_service.numeric_fields(modified, state)
+            scenario = replace(vector, values=normalized, factors=factors,
+                               input_values=modified, excursions=excursions)
+            endpoint_estimates.append(estimate_point(scenario, kernel, calibration).estimate)
+        estimate_at_low, estimate_at_high = endpoint_estimates
+        probes[key] = dispatch_service.CyanProbe(
+            vector.cohort, count, value_low, value_high,
+            estimate_at_low, estimate_at_high,
+            min(endpoint_estimates), max(endpoint_estimates))
+    return probes
+
+
+build_cyan_spans = build_cyan_probes
+resolve_cyan_spans = build_cyan_probes
+
+
+def cyan_evidence_rows(allocation, cyan_probes):
+    jobs = {job.key: job for job in allocation.jobs}
+    rows = []
+    for key in sorted(cyan_probes):
+        probe = cyan_probes[key]
+        verdict, cyan_reason, _ = dispatch_service.cyan_decision(
+            probe, dispatch_service.RISK_CUTOFF)
+        job = jobs[key]
+        rows.append({'单号': key, '作业区': probe.cohort, '处置': job.state,
+                     '处置原因码': job.reason, '青版区间判定': verdict,
+                     '青版区间原因码': cyan_reason, '处置依据': job.summary,
+                     **probe.basis(dispatch_service.RISK_CUTOFF)})
+    return rows
+
+
 def execute(documents, capacity=12, mode='balanced', *, as_of=96):
     intake, windows, state = worksheet(documents,as_of)
     features = feature_service.transform_windows(windows,state)
@@ -114,7 +174,19 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
     previous=monitor_service.fit_baseline(features.train,state.fingerprint)
     drift=monitor_service.scan_current(previous,features.live,state.fingerprint)
     coverage=monitor_service.coverage_by_group(features.calibration,features.live)
-    allocation=dispatch_service.plan_jobs(checked_live,drift.domain,capacity,mode)
+    vectors = {item.key: item for item in features.live}
+    cyan_probes = build_cyan_probes(windows, vectors, state, kernel, fitted_calibration)
+    policy = dispatch_service.Policy.select(capacity, mode)
+    dispatch_assessments = []
+    for assessment in checked_live:
+        probe = cyan_probes.get(assessment.raw.key)
+        if probe is not None and probe.available:
+            assessment = replace(assessment,
+                                 lower=probe.estimate_floor,
+                                 upper=probe.estimate_ceiling)
+        dispatch_assessments.append(assessment)
+    allocation=dispatch_service.allocate(
+        dispatch_assessments, frozenset(drift.domain), policy, cyan_probes)
     closed=audit_service.close_batch(documents,intake,windows,allocation,state.fingerprint,kernel.name,mode)
     performance=calibration_service.performance(evaluated)
     states = dict(closed.totals.states)
@@ -125,9 +197,21 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
         {'label': '暂停及人工判读', 'value': states.get('暂停', 0) + states.get('人工判读', 0)},
         {'label': '额度结余', 'value': allocation.balance},
     ]
-    vectors = {item.key: item for item in features.live}
     row_list = rows_for(allocation, scored, vectors)
+    for row in row_list:
+        probe = cyan_probes.get(row['key'])
+        if probe is not None:
+            verdict, cyan_reason, _ = dispatch_service.cyan_decision(
+                probe, dispatch_service.RISK_CUTOFF)
+            row['cyan_probe'] = asdict(probe)
+            row['cyan_span'] = row['cyan_probe']
+            row['cyan_review'] = {
+                **probe.basis(dispatch_service.RISK_CUTOFF),
+                '判定': verdict,
+                '原因码': cyan_reason,
+            }
     operating_rows = dispatch_service.operating_ledger(row_list)
+    cyan_stage_rows = cyan_evidence_rows(allocation, cyan_probes)
     overtime = calibration_service.boundary_diagnostics(evaluated, 0.51)
     sector = calibration_service.sector_replay(evaluated, 0.51)
     operating_shift = monitor_service.shop_floor_shift(features.train, features.live)
@@ -142,7 +226,7 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
         stage_at(3, kernel.name, weight_rows + model_service.inspection_rows(kernel, features) + comparison_rows(scored)),
         stage_at(4, f'{fitted_calibration.method} · {performance.status} · {performance.count} 条回放实绩', calibration_service.calibration_evidence(performance) + [overtime] + sector),
         stage_at(5, f'{drift.status} · {len(drift.domain)} 张单据需外推判读', monitor_service.shift_evidence(drift, coverage) + operating_shift),
-        stage_at(6, f'本班占用 {allocation.capacity-allocation.balance} / {allocation.capacity} 个工位单位', dispatch_service.action_evidence(allocation) + dispatch_service.operating_group(checked_live, allocation)),
+        stage_at(6, f'本班占用 {allocation.capacity-allocation.balance} / {allocation.capacity} 个工位单位', dispatch_service.action_evidence(allocation) + dispatch_service.operating_group(dispatch_assessments, allocation) + cyan_stage_rows),
         stage_at(7, f'处置凭证 {closed.stamp} · 额度守恒', audit_service.reconciliation_evidence(closed) + field_evidence['执行业务单']),
     ]
     details[6]['operating_rows'] = operating_rows
@@ -150,7 +234,7 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
     points = [{'label': row['key'], 'value': row['estimate'], 'state': row['state'], 'zone': row['zone'],
                'upper': row['interval'], 'cost': row['cost']} for row in sorted(row_list, key=lambda row: row['key'])]
     def estimate(vector):
-        return calibration_service.check_point(model_service.predict_one(kernel, vector), fitted_calibration).estimate
+        return estimate_point(vector, kernel, fitted_calibration).estimate
 
     # Compare interventions against frozen features, model and calibration;
     # scenario estimates never overwrite the base ticket or its decision.

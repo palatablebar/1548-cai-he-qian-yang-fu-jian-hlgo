@@ -83,6 +83,10 @@ function renderMeasurements(card, row) {
     const operations = node('dl',undefined,'record-fields');
     for (const [name,value] of row.operations) operations.append(node('dt',name),node('dd',value));
     card.append(node('h3','作业量计算','inner-heading'),operations);
+    if (row.cyan_review) {
+        card.append(node('h3','青版缺测复算依据','inner-heading'));
+        showTables(card,[row.cyan_review]);
+    }
     if (row.joint_experiments.length) {
         const joint = node('details',undefined,'rejected');
         joint.append(node('summary','联动推演'));
